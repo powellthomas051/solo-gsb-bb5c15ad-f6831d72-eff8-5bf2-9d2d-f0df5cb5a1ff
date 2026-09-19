@@ -25,6 +25,14 @@
 2. 任一项混脚本或存在（库内 / 预占 / 批内）冲突 -> 422 汇总明细，不落库
 3. 全部通过 -> BEGIN IMMEDIATE 单事务落库，事务内复查冲突以锁定
    判定；并发竞争使判定失效 -> 回滚 -> 由调用方重新分析并返回 409
+
+命名空间合并（merge_namespaces）：
+1. BEGIN IMMEDIATE 单事务：先惰性清理两侧过期预占，再把源命名空间的
+   全部已注册名称、有效预占与目标命名空间逐对复查规范名 / 同形冲突；
+   任一冲突即回滚并抛 NamespaceMergeConflictError（带双方记录），不修改数据
+2. 无冲突则在同一事务内把源命名空间的 display_names / name_reservations
+   行 UPDATE 到目标命名空间，返回迁移数量；并发写入导致的唯一约束冲突
+   或锁竞争同样整体回滚，抛 NameConflictError 由调用方重新检查后返回 409
 """
 from __future__ import annotations
 
@@ -72,6 +80,18 @@ class ReservationExpiredError(Exception):
 
 class ReservationConsumedError(Exception):
     """预占已被确认消费：重复或并发确认（HTTP 409 Conflict）。"""
+
+
+class NamespaceMergeConflictError(Exception):
+    """合并前事务内复查发现源与目标命名空间之间存在规范名 / 同形冲突。
+
+    conflicts 为冲突对列表，每对都带源侧与目标侧的完整记录，供调用方
+    直接返回 409；抛出时事务已回滚，未修改任何数据。
+    """
+
+    def __init__(self, conflicts: list[dict]):
+        super().__init__("namespace_merge_conflict")
+        self.conflicts = conflicts
 
 
 def utc_now() -> datetime:
@@ -500,3 +520,126 @@ def list_names(conn: sqlite3.Connection, namespace: str) -> list[dict]:
         (namespace,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _namespace_entries(
+    conn: sqlite3.Connection, namespace: str, now: datetime | None = None
+) -> list[dict]:
+    """读取命名空间内全部已注册名称与有效预占，作为合并冲突判定的条目。
+
+    已注册名称在前（按 id），有效预占在后（按 id）；kind 区分记录类型，
+    预占条目附带 expires_at。
+    """
+    entries: list[dict] = []
+    rows = conn.execute(
+        """
+        SELECT id, original_name, normalized_name
+        FROM display_names
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    for row in rows:
+        entries.append(
+            {
+                "id": row["id"],
+                "original_name": row["original_name"],
+                "normalized_name": row["normalized_name"],
+                "kind": SOURCE_REGISTERED,
+            }
+        )
+    for row in _active_reservation_rows(conn, namespace, now):
+        entries.append(
+            {
+                "id": row["id"],
+                "original_name": row["original_name"],
+                "normalized_name": row["normalized_name"],
+                "kind": SOURCE_RESERVATION,
+                "expires_at": row["expires_at"],
+            }
+        )
+    return entries
+
+
+def find_merge_conflicts(
+    conn: sqlite3.Connection,
+    source_namespace: str,
+    target_namespace: str,
+    now: datetime | None = None,
+) -> list[dict]:
+    """源与目标命名空间之间逐对做规范名相等 / 同形判定。
+
+    覆盖两侧的全部已注册名称与有效预占（命名空间内部记录已由各写入入口
+    保证互不冲突，只需检查跨命名空间组合）。每个冲突对都带上双方完整记录，
+    按源侧条目、目标侧条目的 id 顺序返回。
+    """
+    moment = now or utc_now()
+    source_entries = _namespace_entries(conn, source_namespace, moment)
+    target_entries = _namespace_entries(conn, target_namespace, moment)
+    conflicts: list[dict] = []
+    for source_entry in source_entries:
+        for target_entry in target_entries:
+            if source_entry["normalized_name"] == target_entry["normalized_name"]:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(
+                source_entry["normalized_name"], target_entry["normalized_name"]
+            ):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(
+                {
+                    "reason": reason,
+                    "source": source_entry,
+                    "target": target_entry,
+                }
+            )
+    return conflicts
+
+
+def merge_namespaces(
+    conn: sqlite3.Connection, source_namespace: str, target_namespace: str
+) -> dict:
+    """把源命名空间的全部名称与预占记录迁移到目标命名空间（单事务）。
+
+    BEGIN IMMEDIATE 取写锁后：先惰性清理两侧过期预占（过期记录不参与冲突
+    判定，也不迁移），再复查源与目标之间的规范名 / 同形冲突——发现任一冲突
+    抛 NamespaceMergeConflictError 并回滚，不修改任何数据；无冲突时在同一
+    事务内 UPDATE 两表的 namespace 完成迁移，返回迁移数量。并发写入导致的
+    唯一约束冲突 / 锁竞争同样整体回滚，抛 NameConflictError 由调用方重新
+    检查后返回 409。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = utc_now()
+        # 持锁期间惰性清理两侧过期预占
+        purge_expired_reservations(conn, source_namespace, now)
+        purge_expired_reservations(conn, target_namespace, now)
+        # 事务内复查：持锁期间状态不变，判定结果可信
+        conflicts = find_merge_conflicts(conn, source_namespace, target_namespace, now)
+        if conflicts:
+            raise NamespaceMergeConflictError(conflicts)
+        names_cursor = conn.execute(
+            "UPDATE display_names SET namespace = ? WHERE namespace = ?",
+            (target_namespace, source_namespace),
+        )
+        reservations_cursor = conn.execute(
+            "UPDATE name_reservations SET namespace = ? WHERE namespace = ?",
+            (target_namespace, source_namespace),
+        )
+        conn.commit()
+    except NamespaceMergeConflictError:
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 唯一约束兜底 / 锁竞争：整体回滚
+        conn.rollback()
+        raise NameConflictError(str(exc)) from exc
+
+    return {
+        "source_namespace": source_namespace,
+        "target_namespace": target_namespace,
+        "migrated_names": names_cursor.rowcount,
+        "migrated_reservations": reservations_cursor.rowcount,
+    }

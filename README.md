@@ -12,13 +12,15 @@
 
 此外支持**预占后确认注册**：先 `POST .../reservations` 拿到不可猜测的 token 与过期时间，在 TTL（30–600 秒）内调用 `.../reservations/{token}/claim` 确认。**未过期且未消费的预占与已注册名称完全等价地参与冲突判定**（单条注册、批量注册、新预占、`check` 均会命中），确认成功后才真正写入 `display_names`；过期记录在后续写入时惰性清理。
 
+还支持**命名空间合并**：`POST /namespaces/{source}/merge` 在单个写锁事务中复查源与目标的全部已注册名称、有效预占之间的规范名 / 同形冲突，任一冲突即整体回滚并返回 `409` 及冲突双方记录；无冲突时在同一事务内把源命名空间的名称与预占记录迁移到目标，返回迁移数量。
+
 ## 快速开始（Docker，单条命令）
 
 ```bash
 docker compose up --build
 ```
 
-该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations` 的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。
+该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations` 的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。命名空间合并为纯应用层单事务操作，不新增表结构，随镜像启动即可使用，无需任何额外迁移或配置。
 
 - **API 地址：http://localhost:8000**
 - **交互式文档（Swagger UI）：http://localhost:8000/docs**
@@ -41,11 +43,12 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/namespaces/{namespace}/names/batch` | 批量注册（1–50 个）：全部通过才在**单个事务**中落库 → `201`；任一项混脚本或与库内/有效预占/批内名称冲突 → `422` 汇总明细；并发竞争使判定失效 → 回滚重新分析 → `409` |
 | `POST` | `/namespaces/{namespace}/reservations` | **预占**名称：`{"name": ..., "ttl_seconds": 30–600}` → `201` 返回不可猜测 `token` 与 `expires_at`；冲突 → `409`；混脚本 / TTL 越界 → `422` |
 | `POST` | `/namespaces/{namespace}/reservations/{token}/claim` | **确认预占**：单个 `BEGIN IMMEDIATE` 事务内校验命名空间（`404`）、有效期（过期 `410`）、消费状态（重复/并发确认 `409`）与当前冲突（`409`，不写入），通过后注册并标记已消费 → `201` |
+| `POST` | `/namespaces/{source}/merge` | **合并命名空间**：`{"target_namespace": ...}` → 单个 `BEGIN IMMEDIATE` 事务内复查源与目标全部已注册名称、有效预占的规范名 / 同形冲突；任一冲突 → `409` 返回冲突双方记录、不修改数据；无冲突则同事务迁移名称与预占记录 → `200` 返回迁移数量；并发写入导致复查 / 唯一约束失败 → 整体回滚 → `409`；源与目标相同 → `422` |
 | `POST` | `/namespaces/{namespace}/check` | **只分析不落库**：返回规范名、脚本分析、码点与潜在冲突（含有效预占） |
 | `GET` | `/namespaces/{namespace}/names` | 列出命名空间内已注册名称（预占未确认前不出现在此） |
 | `GET` | `/health` | 健康检查 |
 
-单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`。
+单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–128 字符，非空白，且不得与源相同）。
 
 冲突明细中的 `source` 字段区分冲突来源：`registered`（已注册名称，默认值，老客户端无需改动）或 `reservation`（有效预占，附带该预占的 `expires_at`）。
 
@@ -200,6 +203,38 @@ curl -X POST "http://localhost:8000/namespaces/chat/reservations/${TOKEN}/claim"
 #      "message":"确认时名称与已注册名称或其他有效预占冲突，未写入","conflicts":[...]}}
 ```
 
+合并命名空间：无冲突时在同一事务内迁移源命名空间的全部名称与预占记录，
+返回迁移数量（`migrated_reservations` 含已消费的历史预占；过期预占先被惰性
+清理，不参与判定也不迁移）：
+
+```bash
+curl -X POST http://localhost:8000/namespaces/chat/merge \
+  -H 'Content-Type: application/json' -d '{"target_namespace": "archive"}'
+# 200 {"source_namespace":"chat","target_namespace":"archive",
+#      "migrated_names":3,"migrated_reservations":1}
+```
+
+合并存在冲突 → `409`，`conflicts` 逐对给出冲突双方记录（`kind` 区分
+`registered` / `reservation`，预占记录附 `expires_at`），**不修改任何数据**：
+
+```bash
+# 源 chat 中已注册 "app"，目标 archive 中已注册同形的纯西里尔 "арр"
+curl -X POST http://localhost:8000/namespaces/chat/merge \
+  -H 'Content-Type: application/json' -d '{"target_namespace": "archive"}'
+# 409 {"detail":{"error":"namespace_merge_conflict",
+#      "message":"源与目标命名空间存在规范名相同或同形冲突，未修改任何数据",
+#      "source_namespace":"chat","target_namespace":"archive",
+#      "conflicts":[{"reason":"confusable",
+#        "source":{"id":1,"original_name":"app","normalized_name":"app","kind":"registered"},
+#        "target":{"id":7,"original_name":"арр","normalized_name":"арр","kind":"registered"}}]}}
+
+# 源与目标相同 -> 422
+# 422 {"detail":{"error":"same_namespace","message":"源与目标命名空间相同，无需合并"}}
+```
+
+合并后源命名空间即清空：名称出现在目标命名空间的列表中，迁移过去的有效
+预占在目标命名空间继续占位、并可用原 token 在目标命名空间确认。
+
 ## 判定规则说明
 
 1. **规范化**：`unicodedataplus.normalize("NFKC", name).casefold()`。NFKC 折叠全半角、合字等兼容字符，casefold 折叠大小写（比 lower 更彻底，如 `ß`→`ss`）。
@@ -207,6 +242,7 @@ curl -X POST "http://localhost:8000/namespaces/chat/reservations/${TOKEN}/claim"
 3. **混脚本检测**：逐字符取 `unicodedataplus.script()`，忽略 `Common`（数字、标点、空白等）与 `Inherited`（组合符）后，若出现的脚本中包含 Latin / Cyrillic / Greek 中的两种及以上，判定违规。纯西里尔、纯希腊或与 Han 等其他脚本混用不触发本规则（仍受同形判定约束）。
 4. **批量注册**：先把整批与库内已有名称及有效预占联合分析——每项复用上述单条规则，再对批内两两做规范名相等 / 同形判定，命中时按原请求索引互相标注在双方的 `batch_conflicts` 中。任一项存在混脚本或（库内 / 预占 / 批内）冲突即整体返回 `422` 并汇总所有问题项，不写入任何记录；全部通过时在**单个 SQLite 事务**（`BEGIN IMMEDIATE`）中批量落库，事务内会复查冲突以锁定判定，并发竞争导致判定失效时整批回滚、重新分析并返回 `409` 冲突明细。
 5. **预占与确认**：预占复用规范化、混脚本与同形判定，先做只读分析，再在 `BEGIN IMMEDIATE` 事务中惰性清理过期预占并复查冲突，通过后写入 `name_reservations`（`token = secrets.token_urlsafe(32)`，不可猜测；`expires_at` 为 UTC ISO 8601）。确认时在**单个 `BEGIN IMMEDIATE` 事务**中按序校验：① token 存在且命名空间匹配（否则 `404`）→ ② `expires_at` 未过（过期则删除该记录并提交，返回 `410`）→ ③ `consumed_at IS NULL`（否则 `409`）→ ④ 复查当前冲突，排除自身预占（否则 `409`，不写入）；全部通过后写入 `display_names` 并以条件 `UPDATE ... WHERE consumed_at IS NULL` 回写消费时间，影响行数为 0 即说明并发确认抢先、整事务回滚。因此同一 token 的并发或重复确认至多一次成功。过期记录不在后台定时清理，而是在后续预占 / 注册 / 批量 / 确认事务中惰性删除。
+6. **命名空间合并**：`POST /namespaces/{source}/merge` 在单个 `BEGIN IMMEDIATE` 事务中先惰性清理两侧过期预占，再把源命名空间的全部已注册名称与有效预占同目标命名空间逐对复查（规范名相等记 `normalized_match`，同形记 `confusable`；命名空间内部记录已由各写入入口保证互不冲突，只需检查跨命名空间组合）。发现任一冲突即整体回滚并返回 `409` 与冲突双方记录，不修改任何数据；无冲突则在同一事务内将源命名空间的 `display_names` 与 `name_reservations`（含已消费的历史预占）UPDATE 到目标命名空间，返回迁移数量。并发写入导致复查失效或 `(namespace, normalized_name)` 唯一约束失败时同样整体回滚并返回 `409`。源与目标相同或目标为空 → `422`。
 
 ## 运行测试
 
@@ -226,7 +262,7 @@ pytest
 ```
 app/
   main.py       # FastAPI 路由与错误响应（201/409/422/410/404）
-  service.py    # 注册/批量/预占/确认业务逻辑，逐条冲突判定与事务控制
+  service.py    # 注册/批量/预占/确认/合并业务逻辑，逐条冲突判定与事务控制
   analysis.py   # NFKC+casefold 规范化、脚本与码点分析
   database.py   # SQLite 连接与建表（幂等建表即自动迁移；python -m app.database 可独立初始化）
   schemas.py    # Pydantic 请求/响应模型

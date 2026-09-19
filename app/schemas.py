@@ -12,6 +12,12 @@ def _not_blank(value: str) -> str:
     return value
 
 
+def _namespace_not_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("target_namespace must not be blank")
+    return value
+
+
 # 单个显示名的统一约束：1–64 字符、非空白（注册 / 检查 / 批量接口共用）
 NameStr = Annotated[
     str,
@@ -118,6 +124,25 @@ class BatchRegisterResponse(BaseModel):
 
     namespace: str
     items: list[BatchItemRecord]
+
+
+class MergeRequest(BaseModel):
+    """命名空间合并请求体：目标命名空间（源在路径中）。"""
+
+    target_namespace: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=128),
+        AfterValidator(_namespace_not_blank),
+    ] = Field(examples=["archive"])
+
+
+class MergeResponse(BaseModel):
+    """合并成功响应：源命名空间的名称与预占记录已迁入目标命名空间。"""
+
+    source_namespace: str
+    target_namespace: str
+    migrated_names: int
+    migrated_reservations: int
 
 
 class ErrorDetail(BaseModel):
