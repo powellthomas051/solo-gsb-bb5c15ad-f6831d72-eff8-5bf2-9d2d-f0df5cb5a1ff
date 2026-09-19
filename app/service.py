@@ -25,6 +25,15 @@
 2. 任一项混脚本或存在（库内 / 预占 / 批内）冲突 -> 422 汇总明细，不落库
 3. 全部通过 -> BEGIN IMMEDIATE 单事务落库，事务内复查冲突以锁定
    判定；并发竞争使判定失效 -> 回滚 -> 由调用方重新分析并返回 409
+
+命名空间合并（find_merge_conflicts / merge_namespaces）：
+1. 单个 BEGIN IMMEDIATE 事务内先惰性清理两侧过期预占，再对源与目标的
+   已注册名称及有效预占做跨空间规范名 / 同形复查（同一命名空间内部在
+   写入时已保证互不冲突，只需检查跨空间组合）
+2. 任一冲突 -> 回滚并抛 MergeConflictError（携带双方记录），不修改数据
+3. 无冲突 -> 同一事务内把源命名空间的 display_names 与 name_reservations
+   整体 UPDATE 到目标并返回迁移数量；唯一约束 / 锁竞争等并发异常同样
+   整体回滚，由调用方重新检测后返回 409
 """
 from __future__ import annotations
 
@@ -72,6 +81,19 @@ class ReservationExpiredError(Exception):
 
 class ReservationConsumedError(Exception):
     """预占已被确认消费：重复或并发确认（HTTP 409 Conflict）。"""
+
+
+class MergeConflictError(Exception):
+    """合并命名空间时发现跨空间冲突，或并发写入导致合并事务失败。
+
+    conflicts 为冲突对列表，每项含 reason 与双方记录（source_record /
+    target_record）；唯一约束 / 锁竞争等并发异常兜底时为空，由调用方
+    在回滚后重新检测。
+    """
+
+    def __init__(self, conflicts: list[dict] | None = None):
+        super().__init__("merge_conflict")
+        self.conflicts = conflicts or []
 
 
 def utc_now() -> datetime:
@@ -492,6 +514,125 @@ def claim_reservation(conn: sqlite3.Connection, namespace: str, token: str) -> d
     record["expires_at"] = row["expires_at"]
     record["consumed_at"] = consumed_at
     return record
+
+
+def _merge_entry(row, kind: str) -> dict:
+    """合并冲突记录：kind 区分已注册名称（registered）与有效预占（reservation）。"""
+    entry = {
+        "id": row["id"],
+        "original_name": row["original_name"],
+        "normalized_name": row["normalized_name"],
+        "kind": kind,
+    }
+    if kind == SOURCE_RESERVATION:
+        entry["expires_at"] = row["expires_at"]
+    return entry
+
+
+def _namespace_merge_entries(
+    conn: sqlite3.Connection, namespace: str, now: datetime | None = None
+) -> list[dict]:
+    """读取命名空间内参与合并冲突判定的全部记录：已注册名称 + 有效预占。"""
+    entries = [
+        _merge_entry(row, SOURCE_REGISTERED)
+        for row in conn.execute(
+            """
+            SELECT id, original_name, normalized_name
+            FROM display_names
+            WHERE namespace = ?
+            ORDER BY id
+            """,
+            (namespace,),
+        ).fetchall()
+    ]
+    entries.extend(
+        _merge_entry(row, SOURCE_RESERVATION)
+        for row in _active_reservation_rows(conn, namespace, now)
+    )
+    return entries
+
+
+def find_merge_conflicts(
+    conn: sqlite3.Connection,
+    source_namespace: str,
+    target_namespace: str,
+    now: datetime | None = None,
+) -> list[dict]:
+    """源与目标命名空间之间的跨空间冲突检测（规范名相同 / 同形）。
+
+    两侧都覆盖已注册名称与有效预占；同一命名空间内部的记录在写入时已
+    保证互不冲突，只需检查跨空间组合。返回的每项冲突都带双方记录
+    （source_record 来自源命名空间，target_record 来自目标命名空间）。
+    """
+    moment = now or utc_now()
+    source_entries = _namespace_merge_entries(conn, source_namespace, moment)
+    target_entries = _namespace_merge_entries(conn, target_namespace, moment)
+    conflicts: list[dict] = []
+    for source_entry in source_entries:
+        for target_entry in target_entries:
+            if source_entry["normalized_name"] == target_entry["normalized_name"]:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(
+                source_entry["normalized_name"], target_entry["normalized_name"]
+            ):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            conflicts.append(
+                {
+                    "reason": reason,
+                    "source_record": source_entry,
+                    "target_record": target_entry,
+                }
+            )
+    return conflicts
+
+
+def merge_namespaces(
+    conn: sqlite3.Connection, source_namespace: str, target_namespace: str
+) -> dict:
+    """把源命名空间的全部已注册名称与预占记录合并到目标命名空间。
+
+    调用方需保证 source_namespace != target_namespace。单个 BEGIN IMMEDIATE
+    事务内完成：惰性清理两侧过期预占 -> 跨空间冲突复查（已注册名称 +
+    有效预占）-> 无冲突则整体 UPDATE 迁移。复查发现冲突抛
+    MergeConflictError（携带双方记录），不修改任何数据；唯一约束 /
+    锁竞争等并发异常同样整体回滚，抛 MergeConflictError（conflicts 为空，
+    由调用方重新检测）。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        purge_expired_reservations(conn, source_namespace)
+        purge_expired_reservations(conn, target_namespace)
+        # 事务内复查：持锁期间状态不变，判定结果可信
+        conflicts = find_merge_conflicts(conn, source_namespace, target_namespace)
+        if conflicts:
+            raise MergeConflictError(conflicts)
+        names_cursor = conn.execute(
+            "UPDATE display_names SET namespace = ? WHERE namespace = ?",
+            (target_namespace, source_namespace),
+        )
+        reservations_cursor = conn.execute(
+            "UPDATE name_reservations SET namespace = ? WHERE namespace = ?",
+            (target_namespace, source_namespace),
+        )
+        merged_names = names_cursor.rowcount
+        merged_reservations = reservations_cursor.rowcount
+        conn.commit()
+    except MergeConflictError:
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 唯一约束兜底 / 锁竞争：整体回滚，由调用方重新检测冲突后返回 409
+        conn.rollback()
+        raise MergeConflictError() from exc
+
+    return {
+        "source_namespace": source_namespace,
+        "target_namespace": target_namespace,
+        "merged_names": merged_names,
+        "merged_reservations": merged_reservations,
+    }
 
 
 def list_names(conn: sqlite3.Connection, namespace: str) -> list[dict]:

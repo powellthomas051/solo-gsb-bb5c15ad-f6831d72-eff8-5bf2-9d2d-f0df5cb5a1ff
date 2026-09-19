@@ -19,6 +19,13 @@ NameStr = Annotated[
     AfterValidator(_not_blank),
 ]
 
+# 命名空间的统一约束：1–64 字符、非空白（合并接口的请求体使用）
+NamespaceStr = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=64),
+    AfterValidator(_not_blank),
+]
+
 
 class NameRequest(BaseModel):
     """注册 / 检查请求体。"""
@@ -118,6 +125,26 @@ class BatchRegisterResponse(BaseModel):
 
     namespace: str
     items: list[BatchItemRecord]
+
+
+class MergeRequest(BaseModel):
+    """合并请求体：目标命名空间（源命名空间在路径中）。"""
+
+    target_namespace: NamespaceStr = Field(
+        examples=["chat-v2"],
+        description="目标命名空间：源命名空间的全部名称与预占记录将迁入此处",
+    )
+
+
+class MergeResult(BaseModel):
+    """合并成功响应：迁入目标命名空间的记录数量。"""
+
+    source_namespace: str
+    target_namespace: str
+    merged_names: int = Field(description="迁移的已注册名称数量")
+    merged_reservations: int = Field(
+        description="迁移的预占记录数量（含已消费的历史记录；过期记录已惰性清理，不迁移）"
+    )
 
 
 class ErrorDetail(BaseModel):

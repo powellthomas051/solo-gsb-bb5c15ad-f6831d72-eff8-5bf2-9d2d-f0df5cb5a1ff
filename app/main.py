@@ -5,6 +5,7 @@
 - POST /namespaces/{namespace}/names/batch                        批量注册（201 / 409 / 422，单事务）
 - POST /namespaces/{namespace}/reservations                       预占名称（201 / 409 / 422）
 - POST /namespaces/{namespace}/reservations/{token}/claim         确认预占并注册（201 / 404 / 409 / 410）
+- POST /namespaces/{source}/merge                                 合并命名空间（200 / 409 / 422，单事务）
 - POST /namespaces/{namespace}/check                              只分析不落库（200）
 - GET  /namespaces/{namespace}/names                              列出命名空间内已注册名称
 - GET  /health                                                    健康检查
@@ -23,6 +24,8 @@ from .schemas import (
     BatchNameRequest,
     BatchRegisterResponse,
     ClaimedNameRecord,
+    MergeRequest,
+    MergeResult,
     NameRecord,
     NameRequest,
     ReservationRecord,
@@ -39,12 +42,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定、Latin/Cyrillic/Greek 混脚本拦截；"
         "支持预占后确认注册（reservations / claim），未过期预占与已注册"
-        "名称一样参与全部冲突判定。"
+        "名称一样参与全部冲突判定；支持把源命名空间的名称与预占记录"
+        "整体合并到目标命名空间（merge，冲突时不修改任何数据）。"
     ),
     lifespan=lifespan,
 )
@@ -287,6 +291,57 @@ def claim_reservation(namespace: str, token: str, conn=Depends(get_db)) -> dict:
                 "message": "确认时名称与已注册名称或其他有效预占冲突，未写入",
                 "normalized_name": normalized_name,
                 "conflicts": conflicts or [],
+            },
+        )
+
+
+@app.post(
+    "/namespaces/{source}/merge",
+    response_model=MergeResult,
+    responses={
+        409: {
+            "description": "源与目标存在规范名/同形冲突（含有效预占），或并发写入使合并判定失效；均未修改数据"
+        },
+        422: {"description": "目标命名空间空白或与源命名空间相同"},
+    },
+)
+def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) -> dict:
+    """合并命名空间：把 source 的全部已注册名称与预占记录迁入 target。
+
+    在单个 BEGIN IMMEDIATE 写锁事务中，先对两侧的已注册名称与有效预占
+    做跨空间规范名 / 同形复查：任一冲突 -> 409 并返回双方记录，不修改
+    任何数据；无冲突则在同一事务内迁移并返回迁移数量。并发写入导致
+    复查或唯一约束失败时整体回滚，重新检测后返回 409。
+    """
+    target = payload.target_namespace
+    if target == source:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error": "invalid_merge_target",
+                "message": "目标命名空间与源相同，无需合并",
+            },
+        )
+
+    try:
+        return service.merge_namespaces(conn, source, target)
+    except service.MergeConflictError as exc:
+        if exc.conflicts:
+            # 事务内复查发现冲突：直接返回双方记录，未修改任何数据
+            conflicts = exc.conflicts
+            message = "源与目标命名空间存在规范名/同形冲突（含有效预占），未修改任何数据"
+        else:
+            # 并发写入导致唯一约束/锁失败：已整体回滚，重新检测后返回明细
+            conflicts = service.find_merge_conflicts(conn, source, target)
+            message = "并发写入使合并判定失效，事务已回滚；以下为重新检测后的冲突明细"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "merge_conflict",
+                "message": message,
+                "source_namespace": source,
+                "target_namespace": target,
+                "conflicts": conflicts,
             },
         )
 

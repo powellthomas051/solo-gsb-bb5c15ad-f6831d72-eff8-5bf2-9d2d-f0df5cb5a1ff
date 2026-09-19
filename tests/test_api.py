@@ -692,3 +692,262 @@ def test_reserve_concurrent_race_returns_409_with_refreshed_conflicts(client, mo
         assert conn.execute("SELECT COUNT(*) FROM name_reservations").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ---------- 合并命名空间 POST /namespaces/{source}/merge ----------
+
+
+def merge(client, source="a", target="b"):
+    return client.post(f"/namespaces/{source}/merge", json={"target_namespace": target})
+
+
+def test_merge_success_migrates_names_and_reservations(client):
+    assert register(client, "alice", namespace="a").status_code == 201
+    assert register(client, "Ｂｏｂ", namespace="a").status_code == 201
+    active = reserve(client, "carol", namespace="a").json()
+    consumed = reserve(client, "dave", namespace="a").json()
+    assert claim(client, consumed["token"], namespace="a").status_code == 201
+    # 目标命名空间已有的记录不受影响
+    assert register(client, "erin", namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source_namespace"] == "a"
+    assert body["target_namespace"] == "b"
+    assert body["merged_names"] == 3  # alice、Ｂｏｂ、dave（claim 后注册）
+    assert body["merged_reservations"] == 2  # 有效预占 carol + 已消费历史记录 dave
+
+    # 源命名空间已清空，目标命名空间包含全部名称（id 与原记录保持不变）
+    assert client.get("/namespaces/a/names").json() == []
+    names = {n["original_name"]: n for n in client.get("/namespaces/b/names").json()}
+    assert set(names) == {"alice", "Ｂｏｂ", "dave", "erin"}
+    assert names["Ｂｏｂ"]["normalized_name"] == "bob"
+
+    # 迁移后的有效预占在目标命名空间继续占位，并可在目标命名空间确认
+    resp = register(client, "CAROL", namespace="b")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["conflicts"][0]["source"] == "reservation"
+    assert claim(client, active["token"], namespace="a").status_code == 404
+    assert claim(client, active["token"], namespace="b").status_code == 201
+
+    # 源命名空间已空：同名可以重新注册
+    assert register(client, "alice", namespace="a").status_code == 201
+
+
+def test_merge_empty_source_returns_zero_counts(client):
+    assert register(client, "erin", namespace="b").status_code == 201
+
+    resp = merge(client, "no-such-namespace", "b")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["merged_names"] == 0
+    assert body["merged_reservations"] == 0
+    # 目标命名空间不受影响
+    assert len(client.get("/namespaces/b/names").json()) == 1
+
+
+def test_merge_normalized_conflict_returns_409_with_both_records(client):
+    assert register(client, "Alice", namespace="a").status_code == 201
+    assert register(client, "ALICE", namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "merge_conflict"
+    assert detail["source_namespace"] == "a"
+    assert detail["target_namespace"] == "b"
+    pair = detail["conflicts"][0]
+    assert pair["reason"] == "normalized_match"
+    assert pair["source_record"]["original_name"] == "Alice"
+    assert pair["source_record"]["kind"] == "registered"
+    assert pair["target_record"]["original_name"] == "ALICE"
+    assert pair["target_record"]["kind"] == "registered"
+
+    # 409 不修改任何数据
+    assert [n["original_name"] for n in client.get("/namespaces/a/names").json()] == ["Alice"]
+    assert [n["original_name"] for n in client.get("/namespaces/b/names").json()] == ["ALICE"]
+
+
+def test_merge_confusable_conflict_returns_409(client):
+    assert register(client, "app", namespace="a").status_code == 201
+    assert register(client, CYRILLIC_APP, namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    pair = resp.json()["detail"]["conflicts"][0]
+    assert pair["reason"] == "confusable"
+    assert pair["source_record"]["normalized_name"] == "app"
+    assert pair["target_record"]["normalized_name"] == CYRILLIC_APP
+    assert len(client.get("/namespaces/a/names").json()) == 1
+    assert len(client.get("/namespaces/b/names").json()) == 1
+
+
+def test_merge_conflict_with_active_reservation_on_either_side(client):
+    # 源侧有效预占 vs 目标侧已注册名称
+    r = reserve(client, "app", namespace="a").json()
+    assert register(client, CYRILLIC_APP, namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    pair = resp.json()["detail"]["conflicts"][0]
+    assert pair["reason"] == "confusable"
+    assert pair["source_record"]["kind"] == "reservation"
+    assert pair["source_record"]["expires_at"] == r["expires_at"]
+    assert pair["target_record"]["kind"] == "registered"
+
+    # 反向同样成立：目标侧有效预占 vs 源侧已注册名称
+    assert register(client, "app", namespace="c").status_code == 201
+    r2 = reserve(client, CYRILLIC_APP, namespace="d").json()
+    resp = merge(client, "c", "d")
+    assert resp.status_code == 409
+    pair = resp.json()["detail"]["conflicts"][0]
+    assert pair["source_record"]["kind"] == "registered"
+    assert pair["target_record"]["kind"] == "reservation"
+    assert pair["target_record"]["expires_at"] == r2["expires_at"]
+
+    # 两侧数据均未变化
+    assert client.get("/namespaces/c/names").json()[0]["original_name"] == "app"
+
+
+def test_merge_expired_reservation_does_not_block_and_is_purged(client):
+    reserve(client, "app", ttl_seconds=30, namespace="a")
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE name_reservations SET expires_at = '2000-01-01T00:00:00.000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # 过期预占不参与冲突判定：目标侧的同形名不阻止合并
+    assert register(client, CYRILLIC_APP, namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 200
+    assert resp.json()["merged_reservations"] == 0  # 过期记录被惰性清理，不迁移
+
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM name_reservations").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_merge_same_namespace_rejected(client):
+    resp = merge(client, "a", "a")
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_merge_target"
+
+
+def test_merge_blank_or_missing_target_rejected(client):
+    assert client.post(
+        "/namespaces/a/merge", json={"target_namespace": "   "}
+    ).status_code == 422
+    assert client.post("/namespaces/a/merge", json={}).status_code == 422
+
+
+def test_merge_concurrent_race_returns_409_with_refreshed_conflicts(client, monkeypatch):
+    """并发竞争：合并事务开始前另一连接在目标命名空间抢注同规范名 -> 409，不迁移。"""
+    assert register(client, "alice", namespace="a").status_code == 201
+    real_merge_namespaces = service.merge_namespaces
+
+    def racing_merge_namespaces(conn, source_namespace, target_namespace):
+        # 模拟并发写入：另一个连接在合并事务前向目标命名空间抢注 "ALICE"
+        other = database.get_connection()
+        try:
+            service.insert_name(other, target_namespace, "ALICE", "alice")
+        finally:
+            other.close()
+        return real_merge_namespaces(conn, source_namespace, target_namespace)
+
+    monkeypatch.setattr(service, "merge_namespaces", racing_merge_namespaces)
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "merge_conflict"
+    pair = detail["conflicts"][0]
+    assert pair["reason"] == "normalized_match"
+    assert pair["source_record"]["original_name"] == "alice"
+    assert pair["target_record"]["original_name"] == "ALICE"
+
+    # 整体回滚：源侧记录未迁移，目标侧只有并发写入的 ALICE
+    assert [n["original_name"] for n in client.get("/namespaces/a/names").json()] == ["alice"]
+    assert [n["original_name"] for n in client.get("/namespaces/b/names").json()] == ["ALICE"]
+
+
+def test_merge_unique_constraint_failure_rolls_back_everything(client, monkeypatch):
+    """服务层兜底：唯一约束冲突时整体回滚，重新检测后返回 409。"""
+    assert register(client, "alice", namespace="a").status_code == 201
+    assert register(client, "ALICE", namespace="b").status_code == 201
+    # 只绕过事务内的第一次复查，让 UPDATE 触发 (namespace, normalized_name)
+    # 唯一约束；回滚后的重新检测仍走真实逻辑
+    real_find_merge_conflicts = service.find_merge_conflicts
+    calls = {"count": 0}
+
+    def skip_first_find_merge_conflicts(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return []
+        return real_find_merge_conflicts(*args, **kwargs)
+
+    monkeypatch.setattr(service, "find_merge_conflicts", skip_first_find_merge_conflicts)
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "merge_conflict"
+    # 回滚后重新检测到的冲突明细仍带双方记录
+    assert detail["conflicts"][0]["source_record"]["original_name"] == "alice"
+    assert detail["conflicts"][0]["target_record"]["original_name"] == "ALICE"
+
+    # 两侧数据均未变化
+    assert [n["original_name"] for n in client.get("/namespaces/a/names").json()] == ["alice"]
+    assert [n["original_name"] for n in client.get("/namespaces/b/names").json()] == ["ALICE"]
+
+
+def test_service_merge_rolls_back_when_conflict_detected_in_transaction(client):
+    """服务层：merge 事务内复查发现冲突时抛 MergeConflictError 且不迁移。"""
+    conn = database.get_connection()
+    try:
+        service.insert_name(conn, "a", "app", "app")
+        service.insert_name(conn, "b", CYRILLIC_APP, CYRILLIC_APP)
+        with pytest.raises(service.MergeConflictError) as exc_info:
+            service.merge_namespaces(conn, "a", "b")
+        conflicts = exc_info.value.conflicts
+        assert conflicts[0]["reason"] == "confusable"
+        assert conflicts[0]["source_record"]["kind"] == "registered"
+
+        # 事务已回滚：两侧记录保持原样
+        assert [r["original_name"] for r in service.list_names(conn, "a")] == ["app"]
+        assert [r["original_name"] for r in service.list_names(conn, "b")] == [CYRILLIC_APP]
+    finally:
+        conn.close()
+
+
+def test_merge_concurrent_requests_no_5xx_and_all_names_merged_once(client):
+    """并发回归：同一源命名空间并发合并，名称恰好迁移一次，无 5xx。"""
+    assert register_batch(client, ["n1", "n2"], namespace="a").status_code == 201
+
+    def post(_):
+        return client.post("/namespaces/a/merge", json={"target_namespace": "b"})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(post, range(8)))
+
+    codes = [resp.status_code for resp in responses]
+    assert not any(code >= 500 for code in codes)
+    assert set(codes) <= {200, 409}
+    # 名称恰好迁移一次：各次合并报告的迁移数量之和等于源侧原有数量
+    assert sum(resp.json()["merged_names"] for resp in responses if resp.status_code == 200) == 2
+    assert client.get("/namespaces/a/names").json() == []
+    assert len(client.get("/namespaces/b/names").json()) == 2
+
+
+def test_openapi_documents_merge_endpoint(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/namespaces/{source}/merge" in paths
+    operation = paths["/namespaces/{source}/merge"]["post"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]
